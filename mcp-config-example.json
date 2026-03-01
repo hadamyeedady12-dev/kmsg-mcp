@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "kmsg": {
+      "type": "stdio",
+      "command": "python3",
+      "args": ["-u", "~/.local/share/kmsg-mcp/kmsg-mcp.py"],
+      "env": {
+        "KMSG_BIN": "/opt/homebrew/bin/kmsg",
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  }
+}
