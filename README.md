@@ -1,8 +1,18 @@
 # kmsg-mcp
 
-Claude Code에서 카카오톡 메시지를 읽고 보낼 수 있는 MCP 서버입니다.
+> **카카오톡 공식 API?** 없습니다. **벽타기?** 이제 안 해도 됩니다.
+>
+> `bash install.sh` 한 방이면, Claude Code에서 카톡 읽고 보내기 끝.
 
-[kmsg](https://github.com/channprj/kmsg) CLI를 MCP(Model Context Protocol) 도구로 래핑하여, Claude Code가 자연어로 카카오톡을 제어할 수 있게 합니다.
+---
+
+카카오톡 자동화하려고 셀레니움 돌리고, ADB 붙이고, 별의별 벽타기 해보신 분들 많으시죠?
+
+**이제 그런 고생 끝입니다.**
+
+이 MCP 서버 하나면 Claude Code가 카카오톡을 자연어로 제어합니다. "홍길동한테 카톡 보내줘" 하면 진짜 보냅니다.
+
+[kmsg](https://github.com/channprj/kmsg) CLI를 MCP(Model Context Protocol)로 래핑했고, macOS Accessibility API를 사용하기 때문에 **비공식 API 크롤링 없이** 안정적으로 동작합니다.
 
 ## 주요 기능
 
