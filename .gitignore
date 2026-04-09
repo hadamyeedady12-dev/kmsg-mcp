@@ -2,3 +2,24 @@
 __pycache__/
 *.pyc
 .omc/
+.omx/
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Python
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
