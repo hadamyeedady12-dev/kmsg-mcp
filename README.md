@@ -27,6 +27,8 @@ MCP니 에이전트니 하는 얘기가 쏟아지는데, 막상 카카오톡 하
 | `kmsg_read` | 카카오톡 채팅방의 최근 메시지 읽기 |
 | `kmsg_send` | 카카오톡 채팅방에 텍스트 메시지 보내기 |
 | `kmsg_send_image` | 카카오톡 채팅방에 이미지 보내기 |
+| `kmsg_send_file` | 카카오톡 채팅방에 파일 보내기 (문서, 압축파일 등) |
+| `kmsg_download_file` | 카카오톡 채팅방에서 파일 첨부 다운로드 (자동 스크롤 탐색) |
 
 ## 전제 조건
 
@@ -108,6 +110,13 @@ Claude Code에서 자연어로 사용하면 됩니다:
 
 # 이미지 보내기
 "홍길동한테 ./screenshot.png 이미지 카카오톡으로 보내줘"
+
+# 파일 보내기
+"개발팀 단톡방에 ./report.pdf 파일 보내줘"
+
+# 파일 다운로드
+"홍길동 채팅방에서 파일 다운로드해줘"
+"회장님 채팅방에서 '회의록.hwpx' 파일 다운로드해줘"
 ```
 
 ## MCP 도구 상세
@@ -137,6 +146,28 @@ Claude Code에서 자연어로 사용하면 됩니다:
 | `chat` | string | O | 채팅방 또는 사용자 이름 |
 | `image_path` | string | O | 이미지 파일 경로 |
 | `confirm` | boolean | X | true면 전송 전 확인 요청 (기본값: false) |
+
+### kmsg_send_file
+
+| 파라미터 | 타입 | 필수 | 설명 |
+|----------|------|------|------|
+| `chat` | string | O | 채팅방 또는 사용자 이름 |
+| `file_path` | string | O | 보낼 파일의 절대 경로 |
+| `confirm` | boolean | X | true면 전송 전 확인 요청 (기본값: false) |
+| `keep_window` | boolean | X | 자동 열린 창 유지 (기본값: false) |
+
+### kmsg_download_file
+
+| 파라미터 | 타입 | 필수 | 설명 |
+|----------|------|------|------|
+| `chat` | string | O | 채팅방 또는 사용자 이름 |
+| `filename` | string | X | 다운로드할 파일명 (예: `회의록.txt`). 생략 시 가장 최근 파일 |
+| `save_dir` | string | X | 저장 디렉토리 (기본값: `~/Downloads`) |
+| `max_scroll` | integer | X | 파일 탐색을 위한 최대 스크롤 횟수 (0-20, 기본값: 5) |
+| `icon_template_path` | string | X | 다운로드 아이콘 템플릿 이미지 경로 |
+| `keep_window` | boolean | X | 자동 열린 창 유지 (기본값: false) |
+
+> `filename`을 지정하면 채팅방을 위로 스크롤하며 해당 파일을 찾습니다. 화면에 바로 보이지 않는 파일도 자동 탐색합니다.
 
 ## 트러블슈팅
 
