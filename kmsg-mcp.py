@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -633,20 +634,18 @@ class OpenClawKmsgMCPServer:
             return False
 
     def _find_file_text_ax(self, filename: str) -> List[JSONDict]:
-        """Search KakaoTalk AX tree for static text matching a filename."""
-        safe_name = (
-            filename
-            .replace("\\", "\\\\")
-            .replace('"', '\\"')
-            .replace("\n", "\\n")
-            .replace("\r", "\\r")
-            .replace("\t", "\\t")
-        )
+        """Search KakaoTalk AX tree for static text matching a filename.
+
+        The filename is passed via argv (not string interpolation) to prevent
+        JXA injection — consistent with _find_icons_template's approach.
+        """
         jxa = (
+            'ObjC.import("Foundation");'
+            'var args=ObjC.unwrap($.NSProcessInfo.processInfo.arguments);'
+            'var target=ObjC.unwrap(args[args.length-1]);'
             'var se=Application("System Events");'
             'var kk=se.processes.byName("KakaoTalk");'
             'var R=[];'
-            f'var target="{safe_name}";'
             'function S(e,d){if(d>8)return;try{var c=e.uiElements();'
             'for(var i=0;i<c.length;i++){try{var ch=c[i];'
             'var v="";try{v=ch.value()}catch(x){}'
@@ -665,7 +664,7 @@ class OpenClawKmsgMCPServer:
         )
         try:
             proc = subprocess.Popen(
-                ["osascript", "-l", "JavaScript", "-e", jxa],
+                ["osascript", "-l", "JavaScript", "-e", jxa, "--", filename],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, encoding="utf-8", errors="replace",
             )
@@ -1117,9 +1116,9 @@ class OpenClawKmsgMCPServer:
                 nav.stdout, nav.stderr, nav.latency_ms,
             )
 
-        # 2. Screenshot KakaoTalk window
-        ts = int(time.time())
-        screenshot_path = f"/tmp/kmsg_download_{ts}.png"
+        # 2. Screenshot KakaoTalk window (unpredictable path)
+        fd, screenshot_path = tempfile.mkstemp(suffix=".png", prefix="kmsg_dl_")
+        os.close(fd)
         has_screenshot = self._screenshot_window(screenshot_path)
 
         # 3. Scroll-and-search loop: scan AX tree, scroll up if not found
@@ -1254,6 +1253,13 @@ class OpenClawKmsgMCPServer:
 
         latency_ms = int((time.time() - start) * 1000)
 
+        # Cleanup temp screenshot — avoid leaking chat contents via /tmp
+        try:
+            if os.path.exists(screenshot_path):
+                os.unlink(screenshot_path)
+        except OSError:
+            pass
+
         # 8. Return structured result
         if not download_buttons and not template_matches and not file_texts:
             result: JSONDict = {
@@ -1262,7 +1268,6 @@ class OpenClawKmsgMCPServer:
                     "code": "NO_DOWNLOAD_TARGET",
                     "message": "No download button or icon found in chat",
                     "hint": (
-                        "Check screenshot_path for chat state. "
                         "Provide icon_template_path for template matching."
                     ),
                 },
@@ -1275,13 +1280,11 @@ class OpenClawKmsgMCPServer:
                     f"File '{filename}' not found after {scroll_count} scroll(s). "
                     "The file may be further up in chat history or already expired."
                 )
-            if has_screenshot:
-                result["screenshot_path"] = screenshot_path
             return result
 
         # File text found but no download button = already downloaded
         if filename and file_texts and not download_buttons and not template_matches:
-            result = {
+            return {
                 "ok": False,
                 "error": {
                     "code": "ALREADY_DOWNLOADED",
@@ -1289,13 +1292,10 @@ class OpenClawKmsgMCPServer:
                     "hint": "The file may already be downloaded (shows '열기 · Finder에서 보기').",
                 },
                 "chat": chat,
-                "file_texts": file_texts,
+                "file_texts_found": len(file_texts),
                 "scroll_attempts": scroll_count,
                 "meta": {"latency_ms": latency_ms},
             }
-            if has_screenshot:
-                result["screenshot_path"] = screenshot_path
-            return result
 
         result = {
             "ok": bool(downloaded_file),
@@ -1310,8 +1310,6 @@ class OpenClawKmsgMCPServer:
         if filename:
             result["target_filename"] = filename
             result["file_texts_found"] = len(file_texts)
-        if has_screenshot:
-            result["screenshot_path"] = screenshot_path
         if download_buttons:
             result["buttons"] = download_buttons
         if not downloaded_file:
