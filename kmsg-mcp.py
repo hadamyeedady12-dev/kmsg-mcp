@@ -313,6 +313,76 @@ class OpenClawKmsgMCPServer:
                     "additionalProperties": False,
                 },
             },
+            {
+                "name": "kmsg_send_file",
+                "description": (
+                    "Send a file (any type) to a KakaoTalk chat. "
+                    "Uses macOS clipboard paste method (NSPasteboard → Cmd+V → Enter). "
+                    "Works for documents, archives, videos — not just images."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "chat": {"type": "string", "description": "Chat room or user name"},
+                        "file_path": {"type": "string", "description": "Absolute path to the file to send"},
+                        "confirm": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": "If true, do not send and return CONFIRMATION_REQUIRED",
+                        },
+                        "keep_window": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": "Keep auto-opened KakaoTalk window",
+                        },
+                    },
+                    "required": ["chat", "file_path"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "kmsg_download_file",
+                "description": (
+                    "Download a file attachment from a KakaoTalk chat. "
+                    "Screenshots the chat window, searches for download/save buttons "
+                    "via accessibility tree inspection and optional icon template matching, "
+                    "then clicks to download. Scrolls up automatically to find files "
+                    "not visible in the current viewport."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "chat": {"type": "string", "description": "Chat room or user name"},
+                        "filename": {
+                            "type": "string",
+                            "description": "Target filename to download (e.g. '회의록.txt'). If omitted, downloads the most recent file found.",
+                        },
+                        "save_dir": {
+                            "type": "string",
+                            "default": "~/Downloads",
+                            "description": "Directory to save downloaded file",
+                        },
+                        "icon_template_path": {
+                            "type": "string",
+                            "description": "Path to download icon template image for matching (optional)",
+                        },
+                        "keep_window": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": "Keep auto-opened KakaoTalk window",
+                        },
+                        "max_scroll": {
+                            "type": "integer",
+                            "default": 5,
+                            "minimum": 0,
+                            "maximum": 20,
+                            "description": "Max scroll-up attempts to find file (0 = no scroll, default 5)",
+                        },
+                    },
+                    "required": ["chat"],
+                    "additionalProperties": False,
+                },
+            },
         ]
 
     def _error_payload(
@@ -360,6 +430,254 @@ class OpenClawKmsgMCPServer:
         if code == "ACCESSIBILITY_PERMISSION_DENIED":
             return "Grant Accessibility permission in System Settings > Privacy & Security > Accessibility."
         return "Check raw_stdout/raw_stderr and rerun with trace_ax=true for details."
+
+    # ── File-ops helpers ─────────────────────────────────────────────
+
+    def _osascript(self, script: str, timeout_sec: float = 10.0) -> CommandResult:
+        """Run an AppleScript and return CommandResult."""
+        start = time.time()
+        try:
+            proc = subprocess.Popen(
+                ["osascript", "-e", script],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace",
+            )
+        except OSError as exc:
+            ms = int((time.time() - start) * 1000)
+            return CommandResult(127, "", str(exc), ms, False)
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout_sec)
+            ms = int((time.time() - start) * 1000)
+            return CommandResult(proc.returncode, stdout, stderr, ms, False)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+            ms = int((time.time() - start) * 1000)
+            return CommandResult(124, stdout, stderr, ms, True)
+
+    def _get_kakao_window_id(self) -> Optional[str]:
+        """Get CGWindowID of KakaoTalk's main window via Quartz."""
+        try:
+            r = subprocess.run(
+                ["python3", "-c",
+                 "import Quartz\n"
+                 "for w in Quartz.CGWindowListCopyWindowInfo("
+                 "Quartz.kCGWindowListOptionOnScreenOnly,"
+                 "Quartz.kCGNullWindowID):\n"
+                 " if w.get('kCGWindowOwnerName')=='KakaoTalk'"
+                 " and w.get('kCGWindowLayer',999)==0:\n"
+                 "  print(w['kCGWindowNumber']);break"],
+                capture_output=True, text=True, timeout=5,
+            )
+            wid = r.stdout.strip()
+            return wid if wid and wid.isdigit() else None
+        except Exception:
+            return None
+
+    def _screenshot_window(self, save_path: str) -> bool:
+        """Take a screenshot of KakaoTalk's front window."""
+        self._osascript('tell application "KakaoTalk" to activate', 3.0)
+        time.sleep(0.3)
+        wid = self._get_kakao_window_id()
+        if wid:
+            r = subprocess.run(
+                ["screencapture", "-o", "-x", "-l", wid, save_path],
+                capture_output=True, timeout=5,
+            )
+            if r.returncode == 0 and os.path.isfile(save_path):
+                return True
+        r = subprocess.run(
+            ["screencapture", "-o", "-x", save_path],
+            capture_output=True, timeout=5,
+        )
+        return r.returncode == 0 and os.path.isfile(save_path)
+
+    def _get_kakao_window_bounds(self) -> Optional[Tuple[int, int, int, int]]:
+        """Get (x, y, width, height) of KakaoTalk's front window."""
+        r = self._osascript(
+            'tell application "System Events"\n'
+            '  tell process "KakaoTalk"\n'
+            '    set p to position of window 1\n'
+            '    set s to size of window 1\n'
+            '    return {item 1 of p, item 2 of p, item 1 of s, item 2 of s}\n'
+            '  end tell\n'
+            'end tell', 5.0,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            parts = r.stdout.strip().split(", ")
+            if len(parts) == 4:
+                try:
+                    return (int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3]))
+                except ValueError:
+                    pass
+        return None
+
+    def _find_download_buttons_ax(self) -> List[JSONDict]:
+        """Search KakaoTalk accessibility tree for download/save buttons via JXA."""
+        jxa = (
+            'var se=Application("System Events");'
+            'var kk=se.processes.byName("KakaoTalk");'
+            'var R=[];'
+            'function S(e,d){if(d>8)return;try{var c=e.uiElements();'
+            'for(var i=0;i<c.length;i++){try{var ch=c[i];'
+            'var ds="";try{ds=ch.description()}catch(x){}'
+            'var tt="";try{tt=ch.title()}catch(x){}'
+            'var cm=(ds+" "+tt);'
+            'if(cm.indexOf("\uc800\uc7a5")!==-1||cm.indexOf("\ub2e4\uc6b4\ub85c\ub4dc")!==-1'
+            '||cm.indexOf("download")!==-1||cm.indexOf("Download")!==-1){'
+            'var p=[0,0],sz=[0,0];'
+            'try{p=ch.position()}catch(x){}'
+            'try{sz=ch.size()}catch(x){}'
+            'R.push({role:ch.role(),desc:ds,title:tt,'
+            'x:p[0],y:p[1],w:sz[0],h:sz[1]})}'
+            'S(ch,d+1)}catch(x){}}}catch(x){}}'
+            'try{S(kk.windows[0],0)}catch(x){}'
+            'JSON.stringify(R)'
+        )
+        try:
+            proc = subprocess.Popen(
+                ["osascript", "-l", "JavaScript", "-e", jxa],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace",
+            )
+            stdout, _ = proc.communicate(timeout=15.0)
+            if proc.returncode == 0 and stdout.strip():
+                return json.loads(stdout.strip())
+        except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
+            pass
+        return []
+
+    def _find_icons_template(self, screenshot_path: str, template_path: str) -> List[List[int]]:
+        """Find download icon positions via PIL template matching (optional)."""
+        if not template_path or not os.path.isfile(template_path):
+            return []
+        # Paths passed as sys.argv to avoid code injection.
+        script = (
+            "import sys,json\n"
+            "try:\n"
+            " from PIL import Image\n"
+            "except ImportError:\n"
+            " sys.exit(0)\n"
+            "img=Image.open(sys.argv[1]).convert('RGB')\n"
+            "tpl=Image.open(sys.argv[2]).convert('RGB')\n"
+            "iw,ih=img.size;tw,th=tpl.size\n"
+            "if tw>iw or th>ih:sys.exit(0)\n"
+            "td=list(tpl.getdata());ms=[]\n"
+            "for y in range(0,ih-th+1,3):\n"
+            " for x in range(0,iw-tw+1,3):\n"
+            "  d=0;c=0\n"
+            "  for ty in range(0,th,4):\n"
+            "   for tx in range(0,tw,4):\n"
+            "    sp=img.getpixel((x+tx,y+ty));tp=td[ty*tw+tx]\n"
+            "    d+=abs(sp[0]-tp[0])+abs(sp[1]-tp[1])+abs(sp[2]-tp[2]);c+=1\n"
+            "  if c>0 and d/(c*3)<25:ms.append([x+tw//2,y+th//2])\n"
+            "f=[]\n"
+            "for m in ms:\n"
+            " if not any(abs(m[0]-e[0])<tw and abs(m[1]-e[1])<th for e in f):f.append(m)\n"
+            "print(json.dumps(f[:5]))\n"
+        )
+        try:
+            r = subprocess.run(
+                ["python3", "-c", script, screenshot_path, template_path],
+                capture_output=True, text=True, timeout=30,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                return json.loads(r.stdout.strip())
+        except (subprocess.TimeoutExpired, json.JSONDecodeError):
+            pass
+        return []
+
+    def _click_at(self, x: int, y: int) -> bool:
+        """Click at screen coordinates using Quartz CGEvent."""
+        script = (
+            "import Quartz,time\n"
+            f"p=({x},{y})\n"
+            "Quartz.CGEventPost(Quartz.kCGHIDEventTap,"
+            "Quartz.CGEventCreateMouseEvent(None,"
+            "Quartz.kCGEventLeftMouseDown,p,Quartz.kCGMouseButtonLeft))\n"
+            "time.sleep(0.1)\n"
+            "Quartz.CGEventPost(Quartz.kCGHIDEventTap,"
+            "Quartz.CGEventCreateMouseEvent(None,"
+            "Quartz.kCGEventLeftMouseUp,p,Quartz.kCGMouseButtonLeft))\n"
+        )
+        try:
+            r = subprocess.run(["python3", "-c", script], capture_output=True, timeout=5)
+            return r.returncode == 0
+        except subprocess.TimeoutExpired:
+            return False
+
+    def _scroll_in_window(self, direction: str = "up", amount: int = 5) -> bool:
+        """Scroll inside the KakaoTalk chat window using Quartz CGEvent."""
+        bounds = self._get_kakao_window_bounds()
+        if not bounds:
+            return False
+        cx = bounds[0] + bounds[2] // 2
+        cy = bounds[1] + bounds[3] // 2
+        scroll_delta = amount if direction == "up" else -amount
+        script = (
+            "import Quartz\n"
+            f"p=({cx},{cy})\n"
+            f"delta={scroll_delta}\n"
+            "e=Quartz.CGEventCreateScrollWheelEvent("
+            "None,Quartz.kCGScrollEventUnitLine,1,delta)\n"
+            "Quartz.CGEventSetLocation(e,p)\n"
+            "Quartz.CGEventPost(Quartz.kCGHIDEventTap,e)\n"
+        )
+        try:
+            r = subprocess.run(
+                ["python3", "-c", script],
+                capture_output=True, text=True, timeout=5,
+            )
+            return r.returncode == 0
+        except (subprocess.TimeoutExpired, OSError):
+            return False
+
+    def _find_file_text_ax(self, filename: str) -> List[JSONDict]:
+        """Search KakaoTalk AX tree for static text matching a filename."""
+        safe_name = (
+            filename
+            .replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+            .replace("\t", "\\t")
+        )
+        jxa = (
+            'var se=Application("System Events");'
+            'var kk=se.processes.byName("KakaoTalk");'
+            'var R=[];'
+            f'var target="{safe_name}";'
+            'function S(e,d){if(d>8)return;try{var c=e.uiElements();'
+            'for(var i=0;i<c.length;i++){try{var ch=c[i];'
+            'var v="";try{v=ch.value()}catch(x){}'
+            'var tt="";try{tt=ch.title()}catch(x){}'
+            'var ds="";try{ds=ch.description()}catch(x){}'
+            'var txt=v+" "+tt+" "+ds;'
+            'if(txt.indexOf(target)!==-1){'
+            'var p=[0,0],sz=[0,0];'
+            'try{p=ch.position()}catch(x){}'
+            'try{sz=ch.size()}catch(x){}'
+            'R.push({role:ch.role(),value:v,title:tt,desc:ds,'
+            'x:p[0],y:p[1],w:sz[0],h:sz[1]})}'
+            'S(ch,d+1)}catch(x){}}}catch(x){}}'
+            'try{S(kk.windows[0],0)}catch(x){}'
+            'JSON.stringify(R)'
+        )
+        try:
+            proc = subprocess.Popen(
+                ["osascript", "-l", "JavaScript", "-e", jxa],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace",
+            )
+            stdout, _ = proc.communicate(timeout=15.0)
+            if proc.returncode == 0 and stdout.strip():
+                return json.loads(stdout.strip())
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+        except (json.JSONDecodeError, OSError):
+            pass
+        return []
 
     def _call_kmsg_read(self, arguments: JSONDict) -> JSONDict:
         chat = str(arguments.get("chat", "")).strip()
@@ -651,6 +969,358 @@ class OpenClawKmsgMCPServer:
 
         return response
 
+    # ── File send / download handlers ────────────────────────────────
+
+    def _call_kmsg_send_file(self, arguments: JSONDict) -> JSONDict:
+        chat = str(arguments.get("chat", "")).strip()
+        file_path = str(arguments.get("file_path", "")).strip()
+        confirm = bool(arguments.get("confirm", False))
+
+        if not chat or not file_path:
+            return self._error_payload(
+                "INVALID_ARGUMENT", "chat and file_path are required",
+                "Provide both chat and file_path.", "", "", 0,
+            )
+        if confirm:
+            return self._error_payload(
+                "CONFIRMATION_REQUIRED",
+                "kmsg_send_file blocked because confirm=true",
+                "Ask user for approval, then call with confirm=false.",
+                "", "", 0,
+            )
+
+        file_path = os.path.expanduser(file_path)
+        if not os.path.isfile(file_path):
+            return self._error_payload(
+                "INVALID_ARGUMENT", f"File not found: {file_path}",
+                "Provide a valid file path.", "", "", 0,
+            )
+
+        keep_window = bool(arguments.get("keep_window", False))
+        start = time.time()
+
+        # 1. Navigate to chat (opens the chat window)
+        nav_cmd = [self.runner.kmsg_bin, "read", chat, "--limit", "1"]
+        if keep_window:
+            nav_cmd.append("--keep-window")
+        nav = self.runner.run(nav_cmd, timeout_sec=20.0)
+        if nav.returncode != 0:
+            code = self._extract_error_code(f"{nav.stdout}\n{nav.stderr}")
+            return self._error_payload(
+                code, "Failed to navigate to chat", self._map_hint(code),
+                nav.stdout, nav.stderr, nav.latency_ms,
+            )
+
+        # 2. Copy file to macOS clipboard via NSPasteboard
+        #    Path passed as argv to avoid AppleScript injection.
+        abs_path = os.path.abspath(file_path)
+        copy_script = (
+            "on run argv\n"
+            '  use framework "AppKit"\n'
+            "  set pb to current application's NSPasteboard's generalPasteboard()\n"
+            "  pb's clearContents()\n"
+            "  set fileURL to current application's |NSURL|'s "
+            "fileURLWithPath:(item 1 of argv)\n"
+            "  pb's writeObjects:{fileURL}\n"
+            '  return "OK"\n'
+            "end run"
+        )
+        copy_start = time.time()
+        try:
+            proc = subprocess.Popen(
+                ["osascript", "-e", copy_script, abs_path],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace",
+            )
+            c_out, c_err = proc.communicate(timeout=5.0)
+            copy_r = CommandResult(proc.returncode, c_out, c_err,
+                                   int((time.time() - copy_start) * 1000), False)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            copy_r = CommandResult(124, "", "timeout",
+                                   int((time.time() - copy_start) * 1000), True)
+        if copy_r.returncode != 0:
+            return self._error_payload(
+                "CLIPBOARD_FAILED", "Failed to copy file to clipboard",
+                "Check file path and permissions.",
+                copy_r.stdout, copy_r.stderr, int((time.time() - start) * 1000),
+            )
+
+        # 3. Activate KakaoTalk, paste (Cmd+V), send (Enter)
+        paste_r = self._osascript(
+            'tell application "KakaoTalk" to activate\n'
+            "delay 0.5\n"
+            'tell application "System Events"\n'
+            '  tell process "KakaoTalk"\n'
+            '    keystroke "v" using command down\n'
+            "    delay 1.5\n"
+            "    keystroke return\n"
+            "  end tell\n"
+            "end tell\n"
+            'return "OK"',
+            timeout_sec=15.0,
+        )
+        latency_ms = int((time.time() - start) * 1000)
+
+        if paste_r.returncode != 0:
+            return self._error_payload(
+                "PASTE_FAILED", "Failed to paste file into chat",
+                "Check Accessibility permissions for System Events.",
+                paste_r.stdout, paste_r.stderr, latency_ms,
+            )
+
+        return {
+            "ok": True,
+            "chat": chat,
+            "sent": True,
+            "file_path": abs_path,
+            "meta": {"latency_ms": latency_ms},
+        }
+
+    def _call_kmsg_download_file(self, arguments: JSONDict) -> JSONDict:
+        chat = str(arguments.get("chat", "")).strip()
+        if not chat:
+            return self._error_payload(
+                "INVALID_ARGUMENT", "chat is required",
+                "Provide a chat name.", "", "", 0,
+            )
+
+        save_dir = os.path.expanduser(str(arguments.get("save_dir", "~/Downloads")))
+        icon_template = str(arguments.get("icon_template_path", "")).strip()
+        keep_window = bool(arguments.get("keep_window", False))
+        raw_fn = arguments.get("filename")
+        filename = str(raw_fn).strip() if raw_fn is not None else ""
+        try:
+            max_scroll = max(0, min(20, int(arguments.get("max_scroll", 5))))
+        except (ValueError, TypeError):
+            max_scroll = 5
+        start = time.time()
+
+        try:
+            os.makedirs(save_dir, exist_ok=True)
+        except OSError as exc:
+            return self._error_payload(
+                "INVALID_ARGUMENT",
+                f"Cannot create save_dir: {exc}",
+                "Check directory path and permissions.",
+                "", str(exc), 0,
+            )
+
+        # 1. Navigate to chat (keep window open for interaction)
+        nav_cmd = [self.runner.kmsg_bin, "read", chat, "--limit", "1", "--keep-window"]
+        nav = self.runner.run(nav_cmd, timeout_sec=20.0)
+        if nav.returncode != 0:
+            code = self._extract_error_code(f"{nav.stdout}\n{nav.stderr}")
+            return self._error_payload(
+                code, "Failed to navigate to chat", self._map_hint(code),
+                nav.stdout, nav.stderr, nav.latency_ms,
+            )
+
+        # 2. Screenshot KakaoTalk window
+        ts = int(time.time())
+        screenshot_path = f"/tmp/kmsg_download_{ts}.png"
+        has_screenshot = self._screenshot_window(screenshot_path)
+
+        # 3. Scroll-and-search loop: scan AX tree, scroll up if not found
+        download_buttons: List[JSONDict] = []
+        template_matches: List[List[int]] = []
+        file_texts: List[JSONDict] = []
+        scroll_count = 0
+
+        for attempt in range(max_scroll + 1):
+            # 3a. Search for download buttons via accessibility tree
+            download_buttons = self._find_download_buttons_ax()
+
+            # 3b. If filename specified, also search for file text
+            if filename:
+                file_texts = self._find_file_text_ax(filename)
+
+            # 3c. Template matching fallback (if icon template provided)
+            if icon_template and has_screenshot:
+                template_matches = self._find_icons_template(screenshot_path, icon_template)
+
+            # 3d. Determine if we found a usable target
+            found_target = False
+            _MAX_ROW_DISTANCE = 80  # px — file text and its button must be on the same row
+            if filename:
+                if file_texts and download_buttons:
+                    # Verify a download button is actually near the target file
+                    ft_cy = file_texts[0].get("y", 0) + file_texts[0].get("h", 0) // 2
+                    near_btn = any(
+                        abs((b.get("y", 0) + b.get("h", 0) // 2) - ft_cy) <= _MAX_ROW_DISTANCE
+                        for b in download_buttons
+                    )
+                    if near_btn:
+                        found_target = True
+                    # else: buttons exist but belong to other files — keep scrolling
+                elif file_texts:
+                    # File visible but no download button = already downloaded
+                    found_target = True
+            else:
+                # No filename filter: any download button is a target
+                if download_buttons or template_matches:
+                    found_target = True
+
+            if found_target:
+                break
+
+            # 3e. Not found yet — scroll up and retry
+            if attempt < max_scroll:
+                scrolled = self._scroll_in_window("up", 5)
+                if scrolled:
+                    scroll_count += 1
+                    time.sleep(0.8)
+                    # Re-screenshot after scroll for template matching
+                    if icon_template:
+                        has_screenshot = self._screenshot_window(screenshot_path)
+                else:
+                    break  # scroll failed, stop trying
+
+        # 4. Pick the best download button to click
+        _MAX_ROW_DISTANCE = 80
+        target_btn: Optional[JSONDict] = None
+        if filename and file_texts and download_buttons:
+            # Find the download button closest to the filename text, within row distance
+            ft = file_texts[0]
+            ft_cy = ft.get("y", 0) + ft.get("h", 0) // 2
+            nearby = [
+                b for b in download_buttons
+                if abs((b.get("y", 0) + b.get("h", 0) // 2) - ft_cy) <= _MAX_ROW_DISTANCE
+            ]
+            if nearby:
+                target_btn = min(
+                    nearby,
+                    key=lambda b: abs((b.get("y", 0) + b.get("h", 0) // 2) - ft_cy),
+                )
+        elif download_buttons:
+            target_btn = download_buttons[-1]  # last = most recent in chat
+
+        # 5. Attempt click-to-download
+        downloaded_file: Optional[str] = None
+        clicked = False
+        try:
+            before_files = set(os.listdir(save_dir))
+        except OSError:
+            before_files = set()
+
+        if target_btn:
+            cx = target_btn.get("x", 0) + target_btn.get("w", 0) // 2
+            cy = target_btn.get("y", 0) + target_btn.get("h", 0) // 2
+            if cx > 0 and cy > 0:
+                clicked = self._click_at(cx, cy)
+                time.sleep(3.0)
+        elif template_matches:
+            bounds = self._get_kakao_window_bounds()
+            if bounds:
+                wx, wy = bounds[0], bounds[1]
+                sx = wx + template_matches[-1][0]
+                sy = wy + template_matches[-1][1]
+                clicked = self._click_at(sx, sy)
+                time.sleep(3.0)
+
+        # 6. Handle save dialog ONLY after a successful click
+        if clicked:
+            dialog_r = self._osascript(
+                'tell application "System Events"\n'
+                '  tell process "KakaoTalk"\n'
+                '    if exists sheet 1 of window 1 then\n'
+                '      return "DIALOG"\n'
+                '    end if\n'
+                '  end tell\n'
+                'end tell\n'
+                'return "NONE"', 3.0,
+            )
+            if "DIALOG" in dialog_r.stdout:
+                self._osascript(
+                    'tell application "System Events"\n'
+                    "  keystroke return\n"
+                    "end tell", 3.0,
+                )
+                time.sleep(2.0)
+
+        # 7. Detect newly downloaded file
+        try:
+            after_files = set(os.listdir(save_dir))
+        except OSError:
+            after_files = set()
+        new_files = after_files - before_files
+        if new_files:
+            newest = max(
+                new_files,
+                key=lambda f: os.path.getmtime(os.path.join(save_dir, f)),
+            )
+            downloaded_file = os.path.join(save_dir, newest)
+
+        latency_ms = int((time.time() - start) * 1000)
+
+        # 8. Return structured result
+        if not download_buttons and not template_matches and not file_texts:
+            result: JSONDict = {
+                "ok": False,
+                "error": {
+                    "code": "NO_DOWNLOAD_TARGET",
+                    "message": "No download button or icon found in chat",
+                    "hint": (
+                        "Check screenshot_path for chat state. "
+                        "Provide icon_template_path for template matching."
+                    ),
+                },
+                "chat": chat,
+                "scroll_attempts": scroll_count,
+                "meta": {"latency_ms": latency_ms},
+            }
+            if filename:
+                result["error"]["hint"] = (
+                    f"File '{filename}' not found after {scroll_count} scroll(s). "
+                    "The file may be further up in chat history or already expired."
+                )
+            if has_screenshot:
+                result["screenshot_path"] = screenshot_path
+            return result
+
+        # File text found but no download button = already downloaded
+        if filename and file_texts and not download_buttons and not template_matches:
+            result = {
+                "ok": False,
+                "error": {
+                    "code": "ALREADY_DOWNLOADED",
+                    "message": f"File '{filename}' found but no download button available",
+                    "hint": "The file may already be downloaded (shows '열기 · Finder에서 보기').",
+                },
+                "chat": chat,
+                "file_texts": file_texts,
+                "scroll_attempts": scroll_count,
+                "meta": {"latency_ms": latency_ms},
+            }
+            if has_screenshot:
+                result["screenshot_path"] = screenshot_path
+            return result
+
+        result = {
+            "ok": bool(downloaded_file),
+            "chat": chat,
+            "download_buttons_found": len(download_buttons),
+            "template_matches_found": len(template_matches),
+            "downloaded_file": downloaded_file,
+            "clicked": clicked,
+            "scroll_attempts": scroll_count,
+            "meta": {"latency_ms": latency_ms},
+        }
+        if filename:
+            result["target_filename"] = filename
+            result["file_texts_found"] = len(file_texts)
+        if has_screenshot:
+            result["screenshot_path"] = screenshot_path
+        if download_buttons:
+            result["buttons"] = download_buttons
+        if not downloaded_file:
+            result["hint"] = (
+                "Click attempted but no new file detected in save_dir. "
+                "The file may have been saved elsewhere or download may still be in progress."
+            )
+        return result
+
     def _handle_tools_call(self, arguments: JSONDict) -> JSONDict:
         name = arguments.get("name")
         call_args = arguments.get("arguments", {})
@@ -663,6 +1333,10 @@ class OpenClawKmsgMCPServer:
             result_obj = self._call_kmsg_send(call_args)
         elif name == "kmsg_send_image":
             result_obj = self._call_kmsg_send_image(call_args)
+        elif name == "kmsg_send_file":
+            result_obj = self._call_kmsg_send_file(call_args)
+        elif name == "kmsg_download_file":
+            result_obj = self._call_kmsg_download_file(call_args)
         else:
             raise MCPError(code=-32601, message=f"Unknown tool: {name}")
 
@@ -692,7 +1366,9 @@ class OpenClawKmsgMCPServer:
                     "instructions": (
                         "Use kmsg_read for read-only operations. "
                         "Use kmsg_send and kmsg_send_image with confirm=false (or omitted) for sending. "
-                        "Use confirm=true to intentionally require a confirmation step."
+                        "Use confirm=true to intentionally require a confirmation step. "
+                        "Use kmsg_send_file to send any file type (not just images). "
+                        "Use kmsg_download_file to download file attachments from a chat."
                     ),
                 },
             )
