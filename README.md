@@ -169,6 +169,32 @@ Claude Code에서 자연어로 사용하면 됩니다:
 
 > `filename`을 지정하면 채팅방을 위로 스크롤하며 해당 파일을 찾습니다. 화면에 바로 보이지 않는 파일도 자동 탐색합니다.
 
+## 변경 사항
+
+### v0.3.0 (2026-04-23)
+
+`kmsg_send_file`을 실제로 안정적으로 동작하게 만든 릴리스입니다.
+
+**Fixed**
+- **`kmsg_send_file` 클립보드 paste 안정화**: macOS AppleScript `keystroke "v" using command down`은 카카오톡 입력 필드에 안정적으로 도달하지 않습니다. 클립보드 + Quartz CGEvent 마우스 클릭 + Quartz 키보드 이벤트 조합으로 재구성. (`POSIX file` 클립보드 → 입력 필드 좌표 AX lookup → Quartz click → Cmd+V → Return)
+- **AppleScript `use` 절 위치 오류 수정**: `use framework "AppKit"` 등이 `on run argv` 다음에 와서 osascript 파싱 실패하던 버그 (Korean macOS error: `"end"을(를) 예상했지만 "use"을(를) 발견했습니다`) 수정.
+- **CGWindowID vs AppleScript window index 혼용 버그 수정**: `_get_kakao_window_id()`가 반환하는 Quartz window number를 AppleScript `window N` ordinal로 잘못 사용하던 문제 (-10006 에러) 수정.
+- **윈도우 락**: 다운로드 흐름에서 screenshot/scroll/click이 모두 동일한 채팅 윈도우(채팅 리스트가 아닌 대화 창)를 타게팅하도록 window_id 캐시.
+- **다크모드 한글 OCR 정합화**: 좌표 변환을 `retina_scale = image_width / window_bounds_width`로 정규화하여 Retina 디스플레이에서 클릭 좌표가 빗나가는 문제 수정.
+
+**Added**
+- **send_file 입력 좌표 LRU 캐시**: 같은 채팅방에 30초 이내 연속 send_file 시 좌표 lookup 스킵 (체감 1초 단축).
+- **paste 실패 시 fallback**: Quartz 경로 실패 시 osascript keystroke으로 한 번 자동 재시도.
+- **download_file AX 1차 + OCR fallback**: 화면 녹화 권한이 없는 환경에서도 AX 트리로 첨부 파일 row + 저장 버튼 탐지 시도.
+- **다중 카카오톡 윈도우 지원**: 영문/한글 로케일(`KakaoTalk` / `카카오톡`) 모두 인식.
+
+**Changed**
+- send_file 응답에서 `verified` 필드 제거. 카카오톡의 파일 메시지가 텍스트 read API에 본문 없이 들어와 검증 로직이 항상 false를 리턴하던 문제 (실제로는 정상 도착하는데 false로 보고). 검증을 옵션화하지 않고 신뢰성 높이는 방향(좌표 정확도 + retry)으로 정리.
+
+**Known Issues**
+- `kmsg_download_file`은 다운로드 버튼이 화면에 보이는 row만 AX로 잡힙니다. 화면에 보이지 않는 첨부는 macOS 화면 녹화 권한(System Settings → Privacy & Security → Screen Recording → Claude/터미널 활성화) 부여 후 OCR 경로로만 가능합니다.
+- 카카오톡 1:1 채팅방은 한 번이라도 메시지를 주고받아 채팅 목록에 등록돼있어야 검색됩니다 (친구 목록만으로는 검색 안 됨).
+
 ## 트러블슈팅
 
 ### "kmsg binary not executable"
@@ -199,6 +225,17 @@ which kmsg  # 경로 확인
 
 - 카카오톡에서 표시되는 정확한 이름을 사용하세요
 - 띄어쓰기에 주의하세요
+- **1:1 채팅방의 경우 한 번이라도 대화를 주고받아 채팅 목록에 떠있어야** 검색됩니다 (친구 등록만으로는 안 됨)
+
+### `kmsg_send_file` 응답은 ok:true인데 도착 안 함 (v0.2.0 이하)
+
+v0.3.0에서 해결되었습니다. 업그레이드하세요.
+
+### `kmsg_download_file` "No file or save link found"
+
+다운로드 버튼이 현재 채팅창 화면에 보여야 AX로 잡힙니다. 카카오톡에서 해당 첨부가 보이는 위치까지 스크롤해두고 다시 호출하세요.
+
+화면 밖 첨부 자동 스크롤 탐색은 macOS **화면 녹화 권한**이 필요합니다 (시스템 설정 → 개인정보 보호 및 보안 → 화면 기록 → Claude/터미널 추가 후 재시작).
 
 ## 환경 변수
 
