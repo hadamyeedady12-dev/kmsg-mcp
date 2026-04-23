@@ -9,6 +9,13 @@ __pycache__/
 .env.*
 *.pem
 *.key
+*.secret
+*.secrets
+*.token
+credentials.json
+credentials.*.json
+service-account*.json
+.netrc
 
 # Python
 .ruff_cache/
