@@ -46,12 +46,15 @@ class KmsgRunner:
         if env_bin:
             return env_bin
 
+        local_bin = os.path.expanduser("~/.local/bin/kmsg")
+        if os.path.isfile(local_bin) and os.access(local_bin, os.X_OK):
+            return local_bin
+
         which_bin = shutil.which("kmsg")
         if which_bin:
             return which_bin
 
-        fallback = os.path.expanduser("~/.local/bin/kmsg")
-        return fallback
+        return local_bin
 
     def run(self, args: List[str], timeout_sec: float) -> CommandResult:
         start = time.time()
@@ -185,6 +188,136 @@ class OpenClawKmsgMCPServer:
             pass
 
         return "0.0.0"
+
+    def _get_cached_send_file_coords(self, chat_name: str) -> Optional[Tuple[int, int]]:
+        entry = self._send_file_coord_cache.get(chat_name)
+        if not entry:
+            return None
+        x, y, ts = entry
+        if time.time() - ts > 30.0:
+            self._send_file_coord_cache.pop(chat_name, None)
+            return None
+        return (x, y)
+
+    def _set_cached_send_file_coords(self, chat_name: str, x: int, y: int) -> None:
+        self._send_file_coord_cache[chat_name] = (x, y, time.time())
+
+    def _lookup_send_file_coords(self, chat_name: str) -> CommandResult:
+        start = time.time()
+        try:
+            inspect = subprocess.run(
+                [self.runner.kmsg_bin, "inspect", "--window", "0", "--depth", "3", "--show-frame"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15.0,
+            )
+        except subprocess.TimeoutExpired:
+            ms = int((time.time() - start) * 1000)
+            return CommandResult(124, "", "inspect timeout", ms, True)
+        ms = int((time.time() - start) * 1000)
+        if inspect.returncode != 0:
+            return CommandResult(inspect.returncode, inspect.stdout, inspect.stderr, ms, False)
+        import re
+        m = re.search(r"AXTextArea[^\n]*focused[^\n]*frame: x=(\d+) y=(\d+) w=(\d+) h=(\d+)", inspect.stdout)
+        if not m:
+            m = re.search(r"AXTextArea[^\n]*frame: x=(\d+) y=(\d+) w=(\d+) h=(\d+)", inspect.stdout)
+        if not m:
+            return CommandResult(1, "ERR:no-textarea", inspect.stderr or "textarea not found", ms, False)
+        return CommandResult(0, ",".join(m.groups()), "", ms, False)
+
+    def _normalize_kakao_main_window(self) -> None:
+        self._osascript('tell application "KakaoTalk" to reopen\n' 'tell application "KakaoTalk" to activate', 3.0)
+        time.sleep(0.5)
+        for _ in range(5):
+            probe = self._osascript(
+                'tell application "System Events" to tell process "KakaoTalk" to return count of windows',
+                3.0,
+            )
+            try:
+                count = int((probe.stdout or '').strip())
+            except ValueError:
+                count = 0
+            if count <= 1:
+                break
+            self._osascript(
+                'tell application "KakaoTalk" to activate\n'
+                'delay 0.1\n'
+                'tell application "System Events" to keystroke "w" using command down',
+                3.0,
+            )
+            time.sleep(0.3)
+
+    def _force_open_chat_window(self, chat_name: str) -> CommandResult:
+        self._normalize_kakao_main_window()
+        escaped_chat = chat_name.replace('\\', '\\\\').replace('"', '\\"')
+        script = (
+            'tell application "KakaoTalk" to reopen\n'
+            'tell application "KakaoTalk" to activate\n'
+            'delay 1.0\n'
+            'tell application "System Events"\n'
+            '  tell process "KakaoTalk"\n'
+            '    set frontmost to true\n'
+            '    try\n'
+            '      click button "chatrooms" of window "카카오톡"\n'
+            '    on error\n'
+            '      try\n'
+            '        click button 2 of window 1\n'
+            '      end try\n'
+            '    end try\n'
+            '    delay 0.4\n'
+            '    keystroke "f" using command down\n'
+            '    delay 0.2\n'
+            f'    keystroke "{escaped_chat}"\n'
+            '    delay 0.6\n'
+            '    key code 125\n'
+            '    delay 0.15\n'
+            '    key code 36\n'
+            '    delay 1.0\n'
+            '    try\n'
+            '      return name of every window\n'
+            '    on error\n'
+            '      return ""\n'
+            '    end try\n'
+            '  end tell\n'
+            'end tell'
+        )
+        return self._osascript(script, 12.0)
+
+    def _load_chat_registry_records(self) -> List[JSONDict]:
+        registry_path = os.path.expanduser("~/.kmsg/chat-registry.json")
+        try:
+            with open(registry_path, "r", encoding="utf-8") as fp:
+                payload = json.load(fp)
+        except (OSError, json.JSONDecodeError):
+            return []
+        records = payload.get("records") if isinstance(payload, dict) else None
+        return records if isinstance(records, list) else []
+
+    def _resolve_chat_record(self, chat_name: str) -> Optional[JSONDict]:
+        exact = []
+        for item in self._load_chat_registry_records():
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("displayName", "")).strip()
+            chat_id = str(item.get("chatID", "")).strip()
+            if title == chat_name and chat_id:
+                exact.append(item)
+        if len(exact) == 1:
+            return exact[0]
+        return None
+
+    def _resolve_exact_chat_id(self, chat_name: str) -> Optional[str]:
+        record = self._resolve_chat_record(chat_name)
+        if not record:
+            return None
+        chat_id = str(record.get("chatID", "")).strip()
+        return chat_id or None
+
+    def _resolve_chat_display_name(self, chat_name: str) -> str:
+        record = self._resolve_chat_record(chat_name)
+        if record:
+            display_name = str(record.get("displayName", "")).strip()
+            if display_name:
+                return display_name
+        return chat_name
 
     def _read_message(self) -> Optional[JSONDict]:
         line = sys.stdin.buffer.readline()
@@ -414,12 +547,12 @@ class OpenClawKmsgMCPServer:
 
     def _extract_error_code(self, combined_text: str) -> str:
         lowered = combined_text.lower()
-        if "no such file or directory" in lowered or "not found" in lowered:
-            return "KMSG_BIN_NOT_FOUND"
-        if "WINDOW_NOT_READY" in combined_text:
+        if "WINDOW_NOT_READY" in combined_text or "window not found" in lowered:
             return "KAKAO_WINDOW_UNAVAILABLE"
-        if "SEARCH_MISS" in combined_text:
+        if "SEARCH_MISS" in combined_text or "no chat window found" in lowered:
             return "CHAT_NOT_FOUND"
+        if "no such file or directory" in lowered:
+            return "KMSG_BIN_NOT_FOUND"
         if "Accessibility" in combined_text or "손쉬운 사용" in combined_text:
             return "ACCESSIBILITY_PERMISSION_DENIED"
         return "UNKNOWN_EXEC_FAILURE"
@@ -574,15 +707,20 @@ class OpenClawKmsgMCPServer:
 
     def _get_kakao_window_bounds(self) -> Optional[Tuple[int, int, int, int]]:
         """Get (x, y, width, height) of KakaoTalk's front window."""
-        r = self._osascript(
+        script = (
             'tell application "System Events"\n'
             '  tell process "KakaoTalk"\n'
             '    set p to position of window 1\n'
             '    set s to size of window 1\n'
             '    return {item 1 of p, item 2 of p, item 1 of s, item 2 of s}\n'
             '  end tell\n'
-            'end tell', 5.0,
+            'end tell'
         )
+        r = self._osascript(script, 5.0)
+        if r.returncode != 0 or not r.stdout.strip():
+            self._osascript('tell application "KakaoTalk" to reopen\n' 'tell application "KakaoTalk" to activate', 3.0)
+            time.sleep(0.8)
+            r = self._osascript(script, 5.0)
         if r.returncode == 0 and r.stdout.strip():
             parts = r.stdout.strip().split(", ")
             if len(parts) == 4:
@@ -1026,8 +1164,14 @@ class OpenClawKmsgMCPServer:
         deep_recovery = bool(arguments.get("deep_recovery", self.defaults["deep_recovery"]))
         keep_window = bool(arguments.get("keep_window", False))
         trace_ax = bool(arguments.get("trace_ax", self.defaults["trace_ax"]))
+        exact_chat_id = self._resolve_exact_chat_id(chat)
 
-        cmd = [self.runner.kmsg_bin, "read", chat, "--json", "--limit", str(limit)]
+        self._normalize_kakao_main_window()
+
+        if exact_chat_id:
+            cmd = [self.runner.kmsg_bin, "read", "--chat-id", exact_chat_id, "--json", "--limit", str(limit)]
+        else:
+            cmd = [self.runner.kmsg_bin, "read", chat, "--json", "--limit", str(limit)]
         if deep_recovery:
             cmd.append("--deep-recovery")
         if keep_window:
@@ -1048,6 +1192,20 @@ class OpenClawKmsgMCPServer:
                 latency_ms=first.latency_ms,
             )
 
+        fallback_used = False
+        fallback_meta: JSONDict = {}
+
+        def _should_force_open(run: CommandResult) -> bool:
+            combined = f"{run.stdout}\n{run.stderr}"
+            code = self._extract_error_code(combined)
+            if code in {"CHAT_NOT_FOUND", "KAKAO_WINDOW_UNAVAILABLE"}:
+                return True
+            return (
+                "Could not locate chat transcript area." in run.stdout
+                or "No chat window found for" in run.stdout
+                or "kmsg returned non-JSON output for read --json" in run.stdout
+            )
+
         if first.returncode != 0:
             combined = f"{first.stdout}\n{first.stderr}"
             code = self._extract_error_code(combined)
@@ -1055,20 +1213,25 @@ class OpenClawKmsgMCPServer:
             if code == "CHAT_NOT_FOUND" and not deep_recovery:
                 retry_cmd = cmd + ["--deep-recovery"]
                 retry = self.runner.run(retry_cmd, timeout_sec=15.0)
-                if retry.returncode == 0 and not retry.timed_out:
-                    first = retry
-                else:
-                    retry_combined = f"{retry.stdout}\n{retry.stderr}"
-                    retry_code = self._extract_error_code(retry_combined)
-                    return self._error_payload(
-                        code=retry_code,
-                        message="kmsg read failed after deep-recovery retry",
-                        hint=self._map_hint(retry_code),
-                        raw_stdout=retry.stdout,
-                        raw_stderr=retry.stderr,
-                        latency_ms=retry.latency_ms,
-                    )
-            else:
+                first = retry
+
+            if first.returncode != 0 and _should_force_open(first):
+                forced = self._force_open_chat_window(chat)
+                fallback_used = forced.returncode == 0
+                fallback_meta["force_open_stdout"] = forced.stdout
+                fallback_meta["force_open_stderr"] = forced.stderr
+                fallback_meta["force_open_latency_ms"] = forced.latency_ms
+                if forced.returncode == 0 and not forced.timed_out:
+                    retry_cmd = [self.runner.kmsg_bin, "read", "--chat-id", exact_chat_id, "--json", "--limit", str(limit), "--deep-recovery"] if exact_chat_id else [self.runner.kmsg_bin, "read", chat, "--json", "--limit", str(limit), "--deep-recovery"]
+                    if keep_window:
+                        retry_cmd.append("--keep-window")
+                    if trace_ax:
+                        retry_cmd.append("--trace-ax")
+                    first = self.runner.run(retry_cmd, timeout_sec=40.0)
+
+            if first.returncode != 0:
+                combined = f"{first.stdout}\n{first.stderr}"
+                code = self._extract_error_code(combined)
                 return self._error_payload(
                     code=code,
                     message="kmsg read failed",
@@ -1078,7 +1241,6 @@ class OpenClawKmsgMCPServer:
                     latency_ms=first.latency_ms,
                 )
 
-        # Empty chat room: kmsg exits 0 but prints a text message instead of JSON
         if "No message rows found" in first.stdout:
             response: JSONDict = {
                 "ok": True,
@@ -1091,9 +1253,26 @@ class OpenClawKmsgMCPServer:
                     "empty_chat": True,
                 },
             }
+            if fallback_used:
+                response["meta"]["force_open_fallback"] = True
+                response["meta"].update(fallback_meta)
             if trace_ax and first.stderr.strip():
                 response["meta"]["stderr_trace"] = first.stderr
             return response
+
+        if _should_force_open(first):
+            forced = self._force_open_chat_window(chat)
+            fallback_used = forced.returncode == 0
+            fallback_meta["force_open_stdout"] = forced.stdout
+            fallback_meta["force_open_stderr"] = forced.stderr
+            fallback_meta["force_open_latency_ms"] = forced.latency_ms
+            if forced.returncode == 0 and not forced.timed_out:
+                retry_cmd = [self.runner.kmsg_bin, "read", chat, "--json", "--limit", str(limit), "--deep-recovery"]
+                if keep_window:
+                    retry_cmd.append("--keep-window")
+                if trace_ax:
+                    retry_cmd.append("--trace-ax")
+                first = self.runner.run(retry_cmd, timeout_sec=40.0)
 
         try:
             payload = json.loads(first.stdout)
@@ -1117,7 +1296,12 @@ class OpenClawKmsgMCPServer:
                 "latency_ms": first.latency_ms,
             },
         }
+        if exact_chat_id:
+            response["meta"]["chat_id"] = exact_chat_id
 
+        if fallback_used:
+            response["meta"]["force_open_fallback"] = True
+            response["meta"].update(fallback_meta)
         if trace_ax and first.stderr.strip():
             response["meta"]["stderr_trace"] = first.stderr
 
@@ -1151,8 +1335,12 @@ class OpenClawKmsgMCPServer:
         deep_recovery = bool(arguments.get("deep_recovery", self.defaults["deep_recovery"]))
         keep_window = bool(arguments.get("keep_window", False))
         trace_ax = bool(arguments.get("trace_ax", self.defaults["trace_ax"]))
+        exact_chat_id = self._resolve_exact_chat_id(chat)
 
-        cmd = [self.runner.kmsg_bin, "send", chat, message]
+        if exact_chat_id:
+            cmd = [self.runner.kmsg_bin, "send", "--chat-id", exact_chat_id, message]
+        else:
+            cmd = [self.runner.kmsg_bin, "send", chat, message]
         if deep_recovery:
             cmd.append("--deep-recovery")
         if keep_window:
@@ -1176,14 +1364,27 @@ class OpenClawKmsgMCPServer:
         if run.returncode != 0:
             combined = f"{run.stdout}\n{run.stderr}"
             code = self._extract_error_code(combined)
-            return self._error_payload(
-                code=code,
-                message="kmsg send failed",
-                hint=self._map_hint(code),
-                raw_stdout=run.stdout,
-                raw_stderr=run.stderr,
-                latency_ms=run.latency_ms,
-            )
+            if code in {"CHAT_NOT_FOUND", "KAKAO_WINDOW_UNAVAILABLE"}:
+                target_chat_name = self._resolve_chat_display_name(chat)
+                forced = self._force_open_chat_window(target_chat_name)
+                if forced.returncode == 0 and not forced.timed_out:
+                    retry_cmd = [self.runner.kmsg_bin, "send", "--chat-id", exact_chat_id, message, "--deep-recovery"] if exact_chat_id else [self.runner.kmsg_bin, "send", chat, message, "--deep-recovery"]
+                    if keep_window:
+                        retry_cmd.append("--keep-window")
+                    if trace_ax:
+                        retry_cmd.append("--trace-ax")
+                    run = self.runner.run(retry_cmd, timeout_sec=18.0)
+                    combined = f"{run.stdout}\n{run.stderr}"
+                    code = self._extract_error_code(combined)
+            if run.returncode != 0:
+                return self._error_payload(
+                    code=code,
+                    message="kmsg send failed",
+                    hint=self._map_hint(code),
+                    raw_stdout=run.stdout,
+                    raw_stderr=run.stderr,
+                    latency_ms=run.latency_ms,
+                )
 
         response: JSONDict = {
             "ok": True,
@@ -1194,6 +1395,8 @@ class OpenClawKmsgMCPServer:
                 "stdout": run.stdout,
             },
         }
+        if exact_chat_id:
+            response["meta"]["chat_id"] = exact_chat_id
 
         if trace_ax and run.stderr.strip():
             response["meta"]["stderr_trace"] = run.stderr
@@ -1238,8 +1441,12 @@ class OpenClawKmsgMCPServer:
         deep_recovery = bool(arguments.get("deep_recovery", self.defaults["deep_recovery"]))
         keep_window = bool(arguments.get("keep_window", False))
         trace_ax = bool(arguments.get("trace_ax", self.defaults["trace_ax"]))
+        exact_chat_id = self._resolve_exact_chat_id(chat)
 
-        cmd = [self.runner.kmsg_bin, "send-image", chat, image_path]
+        if exact_chat_id:
+            cmd = [self.runner.kmsg_bin, "send-image", "--chat-id", exact_chat_id, image_path]
+        else:
+            cmd = [self.runner.kmsg_bin, "send-image", chat, image_path]
         if deep_recovery:
             cmd.append("--deep-recovery")
         if keep_window:
@@ -1263,6 +1470,29 @@ class OpenClawKmsgMCPServer:
         if run.returncode != 0:
             combined = f"{run.stdout}\n{run.stderr}"
             code = self._extract_error_code(combined)
+            if code in {"CHAT_NOT_FOUND", "KAKAO_WINDOW_UNAVAILABLE"}:
+                target_chat_name = self._resolve_chat_display_name(chat)
+                forced = self._force_open_chat_window(target_chat_name)
+                if forced.returncode == 0 and not forced.timed_out:
+                    retry_cmd = [self.runner.kmsg_bin, "send-image", "--chat-id", exact_chat_id, image_path, "--deep-recovery"] if exact_chat_id else [self.runner.kmsg_bin, "send-image", chat, image_path, "--deep-recovery"]
+                    if keep_window:
+                        retry_cmd.append("--keep-window")
+                    if trace_ax:
+                        retry_cmd.append("--trace-ax")
+                    run = self.runner.run(retry_cmd, timeout_sec=20.0)
+                    combined = f"{run.stdout}\n{run.stderr}"
+                    code = self._extract_error_code(combined)
+            if "Enter KakaoTalk credentials." in combined or code in {"CHAT_NOT_FOUND", "KAKAO_WINDOW_UNAVAILABLE"}:
+                fallback = self._call_kmsg_send_file({
+                    "chat": chat,
+                    "file_path": image_path,
+                    "confirm": False,
+                    "keep_window": keep_window,
+                })
+                if fallback.get("ok"):
+                    fallback.setdefault("meta", {})["fallback_method"] = "clipboard_file_paste"
+                    fallback["image_path"] = image_path
+                    return fallback
             return self._error_payload(
                 code=code,
                 message="kmsg send-image failed",
@@ -1281,6 +1511,8 @@ class OpenClawKmsgMCPServer:
                 "stdout": run.stdout,
             },
         }
+        if exact_chat_id:
+            response["meta"]["chat_id"] = exact_chat_id
 
         if trace_ax and run.stderr.strip():
             response["meta"]["stderr_trace"] = run.stderr
@@ -1315,17 +1547,15 @@ class OpenClawKmsgMCPServer:
             )
 
         keep_window = bool(arguments.get("keep_window", False))
+        exact_chat_id = self._resolve_exact_chat_id(chat)
+        target_chat_name = self._resolve_chat_display_name(chat)
         start = time.time()
 
-        # 1. Navigate to chat (opens the chat window)
-        nav_cmd = [self.runner.kmsg_bin, "read", chat, "--limit", "1"]
-        if keep_window:
-            nav_cmd.append("--keep-window")
-        nav = self.runner.run(nav_cmd, timeout_sec=20.0)
+        # 1. Open the target chat directly via AppleScript to avoid kmsg auth/bootstrap flakiness.
+        nav = self._force_open_chat_window(target_chat_name)
         if nav.returncode != 0:
-            code = self._extract_error_code(f"{nav.stdout}\n{nav.stderr}")
             return self._error_payload(
-                code, "Failed to navigate to chat", self._map_hint(code),
+                "CHAT_NOT_FOUND", "Failed to open chat window", self._map_hint("CHAT_NOT_FOUND"),
                 nav.stdout, nav.stderr, nav.latency_ms,
             )
 
@@ -1342,32 +1572,18 @@ class OpenClawKmsgMCPServer:
                 copy_r.stdout, copy_r.stderr, int((time.time() - start) * 1000),
             )
 
-        # 3. Raise chat window, locate input field, then Quartz-click it + Cmd+V + Return.
-        #    System Events keystroke does NOT reliably deliver Cmd+V to KakaoTalk's
-        #    text input — Quartz CGEvent posting is required.
-        chat_name = chat
-        cached_coords = self._get_cached_send_file_coords(chat_name)
-        if cached_coords:
-            cx, cy = cached_coords
-            coord_r = CommandResult(0, f"{cx},{cy},0,0", "", 0, False)
-        else:
-            coord_r = self._lookup_send_file_coords(chat_name)
-        if coord_r.returncode != 0 or not coord_r.stdout.strip() or coord_r.stdout.startswith("ERR"):
+        # 3. Raise chat window, estimate the input field from the front window bounds,
+        #    then Quartz-click it + Cmd+V + Return.
+        bounds = self._get_kakao_window_bounds()
+        if not bounds:
             return self._error_payload(
-                "PASTE_FAILED", "Failed to locate chat input field",
+                "PASTE_FAILED", "Failed to locate KakaoTalk window bounds",
                 "Open the chat window in KakaoTalk and retry.",
-                coord_r.stdout, coord_r.stderr, int((time.time() - start) * 1000),
+                "", "", int((time.time() - start) * 1000),
             )
-        try:
-            px, py, pw, ph = (int(float(v)) for v in coord_r.stdout.strip().split(","))
-            cx, cy = px + pw // 2, py + ph // 2
-            self._set_cached_send_file_coords(chat_name, cx, cy)
-        except (ValueError, IndexError):
-            return self._error_payload(
-                "PASTE_FAILED", "Could not parse input field coordinates",
-                "Unexpected coord output.",
-                coord_r.stdout, coord_r.stderr, int((time.time() - start) * 1000),
-            )
+        wx, wy, ww, wh = bounds
+        cx = wx + (ww // 2)
+        cy = wy + max(wh - 48, wh // 2)
 
         # 3b. Quartz click + Cmd+V + Return.
         quartz_script = (
@@ -1425,7 +1641,13 @@ class OpenClawKmsgMCPServer:
                 )
             qproc = fallback_r
 
-        time.sleep(1.5)
+        if not keep_window:
+            self._osascript(
+                'tell application "KakaoTalk" to activate\n'
+                'delay 0.2\n'
+                'tell application "System Events" to keystroke "w" using command down',
+                3.0,
+            )
 
         return {
             "ok": True,
@@ -1433,7 +1655,7 @@ class OpenClawKmsgMCPServer:
             "sent": True,
             "file_path": abs_path,
             "input_coord": [cx, cy],
-            "meta": {"latency_ms": latency_ms},
+            "meta": {"latency_ms": latency_ms, **({"chat_id": exact_chat_id} if exact_chat_id else {})},
         }
 
     def _call_kmsg_download_file(self, arguments: JSONDict) -> JSONDict:
@@ -1470,6 +1692,7 @@ class OpenClawKmsgMCPServer:
             stable_timeout = 20.0
         stable_timeout = max(1.0, min(300.0, stable_timeout))
         start = time.time()
+        exact_chat_id = self._resolve_exact_chat_id(chat)
 
         try:
             os.makedirs(save_dir, exist_ok=True)
@@ -1482,7 +1705,7 @@ class OpenClawKmsgMCPServer:
             )
 
         # 1. Navigate to chat (keep window open for interaction)
-        nav_cmd = [self.runner.kmsg_bin, "read", chat, "--limit", "1", "--keep-window"]
+        nav_cmd = [self.runner.kmsg_bin, "read", "--chat-id", exact_chat_id, "--limit", "1", "--keep-window"] if exact_chat_id else [self.runner.kmsg_bin, "read", chat, "--limit", "1", "--keep-window"]
         nav = self.runner.run(nav_cmd, timeout_sec=20.0)
         if nav.returncode != 0:
             code = self._extract_error_code(f"{nav.stdout}\n{nav.stderr}")
