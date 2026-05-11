@@ -1267,7 +1267,7 @@ class OpenClawKmsgMCPServer:
             fallback_meta["force_open_stderr"] = forced.stderr
             fallback_meta["force_open_latency_ms"] = forced.latency_ms
             if forced.returncode == 0 and not forced.timed_out:
-                retry_cmd = [self.runner.kmsg_bin, "read", chat, "--json", "--limit", str(limit), "--deep-recovery"]
+                retry_cmd = [self.runner.kmsg_bin, "read", "--chat-id", exact_chat_id, "--json", "--limit", str(limit), "--deep-recovery"] if exact_chat_id else [self.runner.kmsg_bin, "read", chat, "--json", "--limit", str(limit), "--deep-recovery"]
                 if keep_window:
                     retry_cmd.append("--keep-window")
                 if trace_ax:
